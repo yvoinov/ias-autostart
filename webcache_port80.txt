@@ -1,0 +1,7 @@
+WebCache tier port 80/443 note
+==============================
+
+To run OHS/WebCache on port 80/443 (bind service on privileged port):
+
+1. cd $ORACLE_HOME/webcache/bin 
+   ./webcache_setuser.sh setroot <oracle owner>

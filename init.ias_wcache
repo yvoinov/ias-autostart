@@ -1,0 +1,206 @@
+#!/bin/sh
+
+# chkconfig: 345 99 01
+# description: Service starts/stops iAS WebCache processes
+# processname: init.ias_wcache
+
+#
+# Start/stop iAS WebCache services as part of system startup/shutdown procedure
+# using SMF or traditional rcx.d scripts sequence (Solaris/Linux).
+#
+# Yuri Voinov (C) 2006-2010
+# Thanks Joost Mulders (Sun Microsystems) for idea
+# and initial implementation.
+#
+# ident "@(#)init.ias_wcache   2.5   10/11/01 YV"
+#
+
+#############
+# Variables #
+#############
+
+#  
+# OS Commands location variables
+#
+AWK=`which awk`
+BASENAME=`which basename`
+CUT=`which cut`
+ECHO=`which echo`
+EGREP=`which egrep`
+LS=`which ls`
+PS=`which ps`
+RM=`which rm`
+SU=`which su`
+TOUCH=`which touch`
+UNAME=`which uname`
+WHOAMI=`which whoami`
+
+OS_NAME=`$UNAME -s|$CUT -f1 -d" "`
+
+# Linux lock directory
+LOCK_DIR="/var/lock/subsys"
+
+# Script name for Linux up/down workaround
+SVC_SHORT_NAME="wcache"
+SCRIPT_NAME="init.ias_$SVC_SHORT_NAME"
+
+# Config file directory. Default is /etc
+CONFIG_DIR="/etc"
+# Config file name.
+CONFIG_FILE="$CONFIG_DIR/ias_$SVC_SHORT_NAME.conf"
+
+###############
+# Subroutines #
+###############
+
+get_config_parameters ()
+{ 
+ # Check if config exists 
+ if [ ! -f "$CONFIG_FILE" ]; then
+  $ECHO "Config file $CONFIG_FILE not found. Exiting..."
+  exit 1
+ else
+ # Load config file into environment
+ . $CONFIG_FILE
+ fi
+}
+
+check_oracle_and_get_uid ()
+{
+ # Check if Oracle sfw installed and get UID if yes
+ orahome=$1
+ oramodule=$2
+
+ if [ -f "$orahome/bin/$oramodule" ]; then
+  ORACLE_UID=`$LS -l $orahome/bin/$oramodule | $AWK '{ print $3 }'`
+ else
+  $ECHO "$0: Oracle software not installed. Exiting..."
+  $ECHO "$0: Oracle software not installed. Exiting..." >> $LOG
+  exit 1
+ fi
+}
+
+iasconsole_ctl ()
+# OEM iasconsole control function
+{
+ cmd=$1
+ orahome=$2
+
+ $SU $ORACLE_UID -c "
+  ORACLE_HOME=$orahome
+  PATH=$orahome/bin:$PATH
+  LD_LIBRARY_PATH=$orahome/lib
+
+  export ORACLE_HOME LD_LIBRARY_PATH
+
+  \$ORACLE_HOME/bin/emctl $cmd iasconsole" >> $LOG
+}
+
+wcache_ctl ()
+# WebCache control function
+{
+ cmd=$1
+ orahome=$2
+
+ if [ -f $ORA_HOME/opmn/bin/opmnctl -a -n "$USEOPMN" ]; then
+  $SU $ORACLE_UID -c "
+   ORACLE_HOME=$orahome
+   PATH=$orahome/bin:$PATH
+   LD_LIBRARY_PATH=$orahome/lib
+  
+   export ORACLE_HOME LD_LIBRARY_PATH
+
+   \$ORACLE_HOME/opmn/bin/opmnctl "$cmd"all
+   if [ "$cmd" = "stop" ]; then
+    \$ORACLE_HOME/opmn/bin/opmnctl status
+   fi
+  " >> $LOG
+ elif [ ! -f $ORA_HOME/opmn/bin/opmnctl -o -z "$USEOPMN" -a -f $ORA_HOME/webcache/bin/webcachectl ]; then
+  $SU $ORACLE_UID -c "
+   ORACLE_HOME=$orahome
+   PATH=$orahome/bin:$PATH
+   LD_LIBRARY_PATH=$orahome/lib
+
+   export ORACLE_HOME LD_LIBRARY_PATH
+
+   \$ORACLE_HOME/webcache/bin/webcachectl "$cmd"
+   if [ "$cmd" != "stop" ]; then
+    \$ORACLE_HOME/webcache/bin/webcachectl status
+   fi
+  " >> $LOG
+ else
+  $ECHO "WebCache not installed or ORA_HOME defined improperly."
+  $ECHO "WebCache not installed or ORA_HOME defined improperly." >> $LOG
+  exit 1
+ fi
+}
+
+##############
+# Main block #
+##############
+
+# Set configuration parameters
+get_config_parameters
+
+# Check ORA_HOME
+if [ -z "$ORA_HOME" ]; then
+ $ECHO "$0: ORA_HOME for WebCache not defined!"
+ $ECHO "Exiting..."
+ exit 1
+fi
+
+# Check oracle and get uid
+check_oracle_and_get_uid "$ORA_HOME" "genclntsh"
+
+case $1 in
+ stop)
+  CMDLIST=stop
+  ;;
+ start)
+  CMDLIST=start
+  ;;
+ restart)
+  CMDLIST="stop start"
+  ;;
+  *)
+  $ECHO "usage $0 <[start|stop|restart>"
+  exit 1
+  ;;
+esac
+
+for CMD in $CMDLIST
+do
+ case $CMD in
+  start)
+  $ECHO "`date` Starting iAS WebCache..." >> $LOG
+   wcache_ctl start $ORA_HOME
+   if [ "$USEIASCTL" = "1" ]; then
+    iasconsole_ctl stop $ORA_HOME
+    iasconsole_ctl start $ORA_HOME
+   fi
+   $ECHO "`date` iAS WebCache started." >> $LOG
+   if [ "$OS_NAME" = "Linux" ]; then
+    # Linux up/down workaround
+    $TOUCH "$LOCK_DIR"/"$SCRIPT_NAME"
+   fi
+  ;;
+ 
+  stop)
+   $ECHO "`date` Stopping iAS WebCache..." >> $LOG
+   if [ "$USEIASCTL" = "1" ]; then
+    iasconsole_ctl stop $ORA_HOME
+   fi
+   wcache_ctl stop $ORA_HOME
+   $ECHO "`date` iAS WebCache stopped." >> $LOG
+   if [ "$OS_NAME" = "Linux" ]; then
+    # Linux up/down workaround
+    $RM -f "$LOCK_DIR"/"$SCRIPT_NAME"
+   fi
+  ;;
+
+  *)
+   $ECHO "usage `$BASENAME $0: <[stop|start|restart]>`"
+   exit 1
+  ;; 
+ esac
+done

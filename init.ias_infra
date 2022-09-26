@@ -1,0 +1,505 @@
+#!/bin/sh
+
+# chkconfig: 345 98 02
+# description: Service starts/stops iAS infrastructure processes
+# processname: init.ias_infra
+
+#
+# Start/stop iAS infrastructure services as part
+# of system startup/shutdown procedure using SMF
+# or traditional rcx.d scripts sequence (Solaris/Linux). 
+#
+# Yuri Voinov (C) 2006-2010
+# Thanks Joost Mulders (Sun Microsystems) for idea
+# and initial implementation.
+#
+# ident "@(#)init.ias_infra   2.5   10/11/01 YV"
+#
+
+#############
+# Variables #
+#############
+
+#
+# OS Commands location variables
+#
+AWK=`which awk`
+BASENAME=`which basename`
+CUT=`which cut`
+ECHO=`which echo`
+EGREP=`which egrep`
+LS=`which ls`
+PRINTF=`which printf`
+PS=`which ps`
+RM=`which rm`
+SU=`which su`
+TOUCH=`which touch`
+UNAME=`which uname`
+WHOAMI=`which whoami`
+
+OS_NAME=`$UNAME -s|$CUT -f1 -d" "`
+
+# Linux lock directory
+LOCK_DIR="/var/lock/subsys"
+
+# Script name for Linux up/down workaround
+SVC_SHORT_NAME="infra"
+SCRIPT_NAME="init.ias_$SVC_SHORT_NAME"
+
+# Config file directory. Default is /etc
+CONFIG_DIR="/etc"
+# Config file name.
+CONFIG_FILE="$CONFIG_DIR/ias_$SVC_SHORT_NAME.conf"
+
+###############
+# Subroutines #
+###############
+
+get_config_parameters ()
+{ 
+ # Check if config exists 
+ if [ ! -f "$CONFIG_FILE" ]; then
+  $ECHO "Config file $CONFIG_FILE not found. Exiting..."
+  exit 1
+ else
+ # Load config file into environment
+ . $CONFIG_FILE
+ fi
+}
+
+check_oracle_and_get_uid ()
+{
+ # Check if Oracle sfw installed and get UID if yes
+ orahome=$1
+ oramodule=$2
+
+ if [ -f "$orahome/bin/$oramodule" ]; then
+  ORACLE_UID=`$LS -l $orahome/bin/$oramodule | $AWK '{ print $3 }'`
+ else
+  $ECHO "$0: Oracle software not installed. Exiting..."
+  $ECHO "$0: Oracle software not installed. Exiting..." >> $LOG
+  exit 1
+ fi
+}
+
+oracle_ctl ()
+{
+ # Oracle database control function
+ cmd=$1
+ orasid=$2
+ orahome=$3
+
+ $SU $ORACLE_UID -c "
+  ORACLE_SID=$orasid
+  ORACLE_HOME=$orahome
+  PATH=$orahome/bin:$PATH
+  LD_LIBRARY_PATH=$orahome/lib
+
+  export ORACLE_HOME ORACLE_SID LD_LIBRARY_PATH
+
+  \$ORACLE_HOME/bin/sqlplus \"/ as sysdba\" <<EOT
+   $cmd
+   exit
+EOT
+ " >> $LOG
+}
+
+tnslsnr_ctl ()
+{
+ # Listener control function
+ cmd=$1
+ orasid=$2
+ orahome=$3
+
+ $SU $ORACLE_UID -c "
+  ORACLE_SID=$orasid
+  ORACLE_HOME=$orahome
+  PATH=$orahome/bin:$PATH
+  LD_LIBRARY_PATH=$orahome/lib
+
+  export ORACLE_HOME ORACLE_SID LD_LIBRARY_PATH
+
+  \$ORACLE_HOME/bin/lsnrctl $cmd
+ " >> $LOG
+}
+
+iasconsole_ctl ()
+{
+ # OEM iasconsole control function
+ cmd=$1
+ orahome=$2
+
+ $SU $ORACLE_UID -c "
+  ORACLE_HOME=$orahome
+  PATH=$orahome/bin:$PATH
+  LD_LIBRARY_PATH=$orahome/lib
+
+  export ORACLE_HOME LD_LIBRARY_PATH
+
+  \$ORACLE_HOME/bin/emctl $cmd iasconsole
+ " >> $LOG
+}
+
+dbconsole_ctl ()
+{
+ # OEM dbconsole control function
+ cmd=$1
+ orasid=$2
+ orahome=$3
+
+ $SU $ORACLE_UID -c "
+  ORACLE_SID=$orasid
+  ORACLE_HOME=$orahome
+  PATH=$orahome/bin:$PATH
+  LD_LIBRARY_PATH=$orahome/lib
+
+  export ORACLE_HOME ORACLE_SID LD_LIBRARY_PATH
+
+  \$ORACLE_HOME/bin/emctl $cmd dbconsole
+ " >> $LOG
+}
+
+oca_ctl ()
+{
+ # OCA control function
+ cmd=$1
+ orahome=$2
+
+ $SU $ORACLE_UID -c "
+  ORACLE_HOME=$orahome
+  PATH=$orahome/bin:$PATH
+  LD_LIBRARY_PATH=$orahome/lib
+
+  export ORACLE_HOME LD_LIBRARY_PATH
+
+  if [ "$cmd" = "stop" ]; then
+   \$ORACLE_HOME/oca/bin/ocactl "$cmd"
+  else
+   \$ORACLE_HOME/oca/bin/ocactl "$cmd"
+  fi
+ " >> $LOG
+}
+
+opmn_ctl ()
+{
+ # OPMN control function
+ cmd=$1
+ orahome=$2
+
+ $SU $ORACLE_UID -c "
+  ORACLE_HOME=$orahome
+  PATH=$orahome/bin:$PATH
+  LD_LIBRARY_PATH=$orahome/lib
+
+  export ORACLE_HOME LD_LIBRARY_PATH
+
+  if [ "$cmd" = "stop" ]; then
+   \$ORACLE_HOME/opmn/bin/opmnctl "$cmd"all
+  else
+   \$ORACLE_HOME/opmn/bin/opmnctl "$cmd"all
+   \$ORACLE_HOME/opmn/bin/opmnctl status
+  fi
+ " >> $LOG
+}
+
+isrunning ()
+{
+ # Check if process is running
+ par_proc=$1
+
+ RUNNING=`$PS -eopid,ppid,ruser,rgroup,args | \
+   $EGREP "($par_proc($| ))" 2>/dev/null`
+ if [ ! -z "$RUNNING" ]; then
+  $ECHO "1"
+ else
+  $ECHO "0"
+ fi
+}
+
+usage_and_exit ()
+{
+ # Print usage and exit
+ $ECHO "usage `$BASENAME $0`: [stop|start|restart]"
+ exit 1
+}
+
+check_asm ()
+{
+ # Check ASM instance(s) in oratab
+ ASM="`$EGREP '\+' $ORATAB`"
+ if [ -z "$ASM" ]; then
+  $ECHO "0"
+ else
+  $ECHO "1"
+ fi
+}
+
+check_oratab ()
+{
+ # Check oratab and set ORATAB variable when found
+ # If ORACLE_SID and ORACLE_HOME not specified, let's get it from oratab
+ if [ -z "$ORACLE_SID" -o -z "$ORACLE_HOME" ]; then
+  # Try to find an oratab file
+  if [ -z "$ORATAB" ]; then
+   if [ -f "/var/opt/oracle/oratab" ]; then
+    ORATAB="/var/opt/oracle/oratab"      # Solaris-type location
+    use_oratab="1"
+   elif [ -f "/etc/oratab" ]; then
+    ORATAB="/etc/oratab"                 # Linux/HPUX-type location
+    use_oratab="1"
+   else
+    $ECHO "$0: Could not find oratab file in known places."
+    exit 1
+   fi
+  elif [ ! -f "$ORATAB" ]; then
+   $ECHO "$0: Could not find oratab: '$ORATAB'"
+   exit 1
+  fi
+ else
+  use_oratab="0"
+ fi
+}
+
+do_asm_command ()
+{
+ # Get ASM SID's and Oracle homes from oratab
+ for S in "`$AWK '/^\+[a-zA-Z0-9_-]*:.*:[YNyn]/ { print $0 }'`"
+ do
+  ASM_SID="`$ECHO $S|$CUT -f1 -d':'`"
+  ASM_OHOME="`$ECHO $S|$CUT -f2 -d':'`"
+  ASM_AUTOSTART="`$ECHO $S $ASM|$CUT -f3 -d':'`"
+  # Check oratab ASM values
+  if [ -z "$ASM_SID" -o -z "$ASM_OHOME" -o -z "$ASM_AUTOSTART" ]; then
+   $ECHO "$ORATAB should have: ASM_SID:ASM_ORACLE_HOME:AUTOSTART[YN]"
+   exit 1
+  fi
+  # If ASM autostart specified, do startup process
+  if [ "$ASM_AUTOSTART" = "Y" -o "$ASM_AUTOSTART" = "y" ]; then
+   # Get ASM sid template (without "+")
+   asm_sid_tpl=`$ECHO "$ASM_SID"|$CUT -f2 -d'+'`
+   $PRINTF "$ASM_SID:"
+   case $CMD in
+    start)
+     if [ "`isrunning $asm_sid_tpl`" = "1" ]; then
+      $ECHO "already running."
+     else
+      oracle_ctl "startup " $ASM_SID $ASM_OHOME $ORACLE_ASM_PRIV
+      if [ "`isrunning $asm_sid_tpl`" = "1" ]; then
+       $ECHO "started."
+      else
+       $ECHO "start failed!"
+      fi
+     fi
+    ;;
+    stop)
+     if [ "`isrunning $asm_sid_tpl`" = "0" ]; then
+      $ECHO "not running."
+     else 
+      oracle_ctl "shutdown $ASM_SHUTDOWN_MODE" $ASM_SID $ASM_OHOME $ORACLE_ASM_PRIV
+      if [ "`isrunning $asm_sid_tpl`" = "0" ]; then
+       $ECHO "stopped."
+      else
+       $ECHO "stop failed!"
+      fi
+     fi
+    ;;
+  esac
+  else
+   $ECHO "$ASM_SID:autostart disabled."
+   $ECHO "$ASM_SID:autostart disabled." >> $LOG
+  fi
+ done < "$ORATAB"
+}
+
+do_command ()
+{
+ # Do start/stop/restart command
+
+ # Check oracle and get UID
+ check_oracle_and_get_uid "$OHOME" "oracle"
+
+ # If oracle installed, do command
+ for CMD in $CMDLIST
+ do 
+  case $CMD in 
+
+   start)
+    $ECHO "`date` Starting iAS Infrastructure..." >> $LOG
+    # Start listener
+    $PRINTF "Listener:"
+    if [ "`isrunning tnslsnr`" = "1" ]; then
+     $ECHO "already running."
+    else
+     tnslsnr_ctl start $SID $OHOME
+     if [ "`isrunning tnslsnr`" = "1" ]; then
+      $ECHO "started."
+     else
+      $ECHO "start failed!"
+     fi
+    fi
+    if [ "`check_asm`" = "1" ]; then
+     do_asm_command
+    fi
+    $PRINTF "$SID:"
+    if [ "`isrunning _smon_$SID`" = "1" ]; then
+     $ECHO "already running."
+    else
+     oracle_ctl "startup " $SID $OHOME $ORACLE_DB_PRIV
+     if [ "`isrunning _smon_$SID`" = "1" ]; then
+      $ECHO "started."
+     else
+      $ECHO "start failed!"
+     fi
+    fi
+    if [ "$USEOCA" = "1" ]; then
+     # Start OCA
+     oca_ctl start $OHOME
+    fi
+    $PRINTF "OPMN:"
+    opmn_ctl start $OHOME
+    if [ "`isrunning opmn`" = "1" ]; then
+     $ECHO "started."
+    else
+     $ECHO "start failed!"
+    fi
+    if [ "$USEIASCTL" = "1" ]; then
+     # Start iAS Control
+     $PRINTF "iAS Control:"
+     iasconsole_ctl stop $OHOME
+     iasconsole_ctl start $OHOME
+    fi
+    if [ "$USEDBCTL" = "1" ]; then
+     # Start DB Control
+     $PRINTF "DB Control:"
+     dbconsole_ctl stop $SID $OHOME
+     dbconsole_ctl start $SID $OHOME
+    fi
+    $ECHO "`date` iAS Infrastructure started." >> $LOG
+    if [ "$OS_NAME" = "Linux" ]; then
+     # Linux up/down workaround
+     $TOUCH "$LOCK_DIR"/"$SCRIPT_NAME"
+    fi
+   ;;
+
+   stop)
+    $ECHO "`date` Stopping iAS Infrastructure..." >> $LOG
+    if [ "$USEDBCTL" = "1" ]; then
+     # Stop DB Control
+     $PRINTF "DB Control:"
+     dbconsole_ctl stop $SID $OHOME
+    fi
+    if [ "$USEIASCTL" = "1" ]; then
+     # Stop iAS Control
+     $PRINTF "iAS Control:"
+     iasconsole_ctl stop $OHOME
+    fi
+    $PRINTF "OPMN:"
+    opmn_ctl stop $OHOME
+    if [ "`isrunning opmn`" = "0" ]; then
+     $ECHO "stopped."
+    else
+     $ECHO "stop failed!"
+    fi
+
+    if [ "$USEOCA" = "1" ]; then
+     # Stop OCA
+     oca_ctl stop $OHOME
+    fi
+    $PRINTF "$SID:"
+    if [ "`isrunning _smon_$SID`" = "0" ]; then
+     $ECHO "not running."
+    else 
+     oracle_ctl "shutdown immediate" $SID $OHOME $ORACLE_DB_PRIV
+     if [ "`isrunning _smon_$SID`" = "0" ]; then
+      $ECHO "stopped."
+     else
+      $ECHO "stop failed!"
+     fi
+    fi
+    if [ "`check_asm`" = "1" ]; then
+     do_asm_command
+    fi
+    # Stop listener
+    $PRINTF "Listener:"
+    if [ "`isrunning tnslsnr`" = "0" ]; then
+     $ECHO "not running."
+    else
+     tnslsnr_ctl stop $SID $OHOME
+     if [ "`isrunning tnslsnr`" = "0" ]; then
+      $ECHO "stopped."
+     else
+      $ECHO "stop failed!"
+     fi
+    fi
+    $ECHO "`date` iAS Infrastructure stopped." >> $LOG
+    if [ "$OS_NAME" = "Linux" ]; then
+     # Linux up/down workaround
+     $RM -f "$LOCK_DIR"/"$SCRIPT_NAME"
+    fi
+   ;;
+
+   *)
+    usage_and_exit
+   ;;
+  esac
+  $ECHO ""
+ done
+}
+
+##############
+# Main block #
+##############
+
+# Set configuration parameters
+get_config_parameters
+
+case $1 in
+ stop)
+  CMDLIST=stop
+  ;;
+ start)
+  CMDLIST=start
+  ;;
+ restart)
+  CMDLIST="stop start"
+  ;;
+ *)
+  usage_and_exit
+  ;;
+esac
+
+# Check oratab
+check_oratab
+
+$ECHO "`$BASENAME $0` will execute $1 for services:"
+
+if [ "$use_oratab" = "1" ]; then
+ # Get SID's from oratab
+ for S in `$AWK '/^[a-zA-Z0-9_-]*:.*:[YNyn]/ { print $0 }'`
+ do
+  SID=`$ECHO $S|$CUT -f1 -d':'`
+  OHOME=`$ECHO $S|$CUT -f2 -d':'`
+  AUTOSTART=`$ECHO $S|$CUT -f3 -d':'`
+
+  if [ -z "$SID" -o -z "$OHOME" -o -z "$AUTOSTART" ]; then
+   $ECHO "$ORATAB should have: SID:ORACLE_HOME:AUTOSTART[YN]"
+   exit 1
+  fi
+
+  if [ "$AUTOSTART" = "Y" -o "$AUTOSTART" = "y" ]; then
+   # Execute specified command
+   do_command
+  else
+   $ECHO "$SID:autostart disabled."
+   $ECHO "$SID:autostart disabled." >> $LOG
+  fi
+ done < "$ORATAB"
+else
+ # If ORACLE_SID and ORACLE_HOME specified, set it here
+ SID="$ORACLE_SID"
+ OHOME="$ORACLE_HOME"
+ # Execute specified command
+ do_command
+fi
+
+exit 0

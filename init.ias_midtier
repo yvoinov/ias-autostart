@@ -1,0 +1,347 @@
+#!/bin/sh
+
+# chkconfig: 345 99 01
+# description: Service starts/stops iAS middle-tier processes
+# processname: init.ias_midtier
+#
+# Start/stop iAS local middle tier services as part of system
+# startup/shutdown procedure using SMF or traditional rcx.d
+# scripts sequence (Solaris/Linux).
+#
+# Yuri Voinov (C) 2006-2010
+# Thanks Joost Mulders (Sun Microsystems) for idea
+# and initial implementation.
+#
+# ident "@(#)init.midtier   2.5   10/11/01 YV"
+#
+
+#############
+# Variables #
+#############
+
+#
+# OS boot directory location
+#
+BOOT_DIR="/etc/init.d"
+
+# 
+# OS Commands location variables
+#
+AWK=`which awk`
+BASENAME=`which basename`
+CUT=`which cut`
+ECHO=`which echo`
+EGREP=`which egrep`
+ID=`which id`
+LS=`which ls`
+PERL=`which perl`
+PS=`which ps`
+RM=`which rm`
+SU=`which su`
+TOUCH=`which touch`
+UNAME=`which uname`
+
+OS_NAME=`$UNAME -s|$CUT -f1 -d" "`
+
+# Linux lock directory
+LOCK_DIR="/var/lock/subsys"
+
+# Script name for Linux up/down workaround
+SVC_SHORT_NAME="midtier"
+SCRIPT_NAME="init.ias_$SVC_SHORT_NAME"
+
+# Config file directory. Default is /etc
+CONFIG_DIR="/etc"
+# Config file name.
+CONFIG_FILE="$CONFIG_DIR/ias_$SVC_SHORT_NAME.conf"
+
+###############
+# Subroutines #
+###############
+
+get_config_parameters ()
+{ 
+ # Check if config exists 
+ if [ ! -f "$CONFIG_FILE" ]; then
+  $ECHO "Config file $CONFIG_FILE not found. Exiting..."
+  exit 1
+ else
+ # Load config file into environment
+ . $CONFIG_FILE
+ fi
+}
+
+check_oracle_and_get_uid ()
+{
+ # Check if Oracle sfw installed and get UID if yes
+ orahome=$1
+ oramodule=$2
+
+ if [ -f "$orahome/bin/$oramodule" ]; then
+  ORACLE_UID=`$LS -l $orahome/bin/$oramodule | $AWK '{ print $3 }'`
+ else
+  $ECHO "$0: Oracle software not installed. Exiting..."
+  $ECHO "$0: Oracle software not installed. Exiting..." >> $LOG
+  exit 1
+ fi
+}
+
+tnslsnr_ctl ()
+# Listener control function. Uses for IMAP service on OCS
+{
+ cmd=$1
+ orahome=$3
+
+ $SU $ORACLE_UID -c "
+  ORACLE_HOME=$orahome
+  PATH=$orahome/bin:$PATH
+  LD_LIBRARY_PATH=$orahome/lib
+
+  export ORACLE_HOME LD_LIBRARY_PATH
+
+  \$ORACLE_HOME/bin/lsnrctl $cmd
+ " >> $LOG
+}
+
+iasconsole_ctl ()
+# OEM iasconsole control function
+{
+ cmd=$1
+ orahome=$2
+
+ $SU $ORACLE_UID -c "
+  ORACLE_HOME=$orahome
+  PATH=$orahome/bin:$PATH
+  LD_LIBRARY_PATH=$orahome/lib
+
+  export ORACLE_HOME LD_LIBRARY_PATH
+
+  \$ORACLE_HOME/bin/emctl $cmd iasconsole
+ " >> $LOG
+}
+
+opmn_ctl ()
+# OPMN control function
+{
+ cmd=$1
+ orahome=$2
+
+ # Start all OPMN processes as oracle owner
+ $SU $ORACLE_UID -c "
+  ORACLE_HOME=$orahome
+  PATH=$orahome/bin:$PATH
+  LD_LIBRARY_PATH=$orahome/lib
+
+  export ORACLE_HOME LD_LIBRARY_PATH
+
+  if [ "$cmd" = "stop" ]; then
+   \$ORACLE_HOME/opmn/bin/opmnctl "$cmd"all
+  else
+   \$ORACLE_HOME/opmn/bin/opmnctl "$cmd"
+   \$ORACLE_HOME/opmn/bin/opmnctl "$cmd"proc ias-component=WebCache
+   \$ORACLE_HOME/opmn/bin/opmnctl "$cmd"all
+   \$ORACLE_HOME/opmn/bin/opmnctl status
+  fi
+ " >> $LOG
+}
+
+isrunning ()
+{
+ # Check if process is running
+ par_proc=$1
+
+ RUNNING=`$PS -eopid,ppid,ruser,rgroup,args | \
+   $EGREP "($par_proc($| ))" 2>/dev/null`
+ if [ ! -z "$RUNNING" ]; then
+  $ECHO "1"
+ else
+  $ECHO "0"
+ fi
+}
+
+infra_running ()
+{
+# Check remote/local infrastructure running
+
+ attempt=1
+ while [ "$attempt" -lt "$CHECK_LIMIT" ]; do
+  $PERL -e 'use Socket; $server=$ARGV[0]; $port=$ARGV[1]; $server_addr=(gethostbyname($server))[4]; $server_struct=pack("S n a4 x8", AF_INET, $port, $server_addr); $proto=(getprotobyname("tcp"))[2]; socket(MYSOCK, PF_INET, SOCK_STREAM, $proto); connect(MYSOCK, $server_struct) || exit(0); exit(1);' $IHOST $OID_PORT
+  if [ "$?" != "0" ]; then
+   break
+  else
+   attempt=`expr $attempt + 1`
+   sleep $GRACETIME
+  fi
+ done
+ if [ "$retcode" != "0" ]; then
+  $ECHO "1"
+ else 
+  $ECHO "0"
+ fi
+}
+
+midtier_running ()
+{
+# Check midtier running
+
+ attempt=1
+ while [ "$attempt" -lt "$CHECK_LIMIT" ]; do
+  # Check ONS_REQ running
+  $PERL -e 'use Socket; $server=$ARGV[0]; $port=$ARGV[1]; $server_addr=(gethostbyname($server))[4]; $server_struct=pack("S n a4 x8", AF_INET, $port, $server_addr); $proto=(getprotobyname("tcp"))[2]; socket(MYSOCK, PF_INET, SOCK_STREAM, $proto); connect(MYSOCK, $server_struct) || exit(0); exit(1);' $IHOST $ONS_REQ
+  if [ "$?" != "0" ]; then
+   ONS_REQ_RUN="1"
+  else
+   ONS_REQ_RUN="0"
+  fi
+  # End check ONS_REQ running
+  # Check ONS_REM running
+  $PERL -e 'use Socket; $server=$ARGV[0]; $port=$ARGV[1]; $server_addr=(gethostbyname($server))[4]; $server_struct=pack("S n a4 x8", AF_INET, $port, $server_addr); $proto=(getprotobyname("tcp"))[2]; socket(MYSOCK, PF_INET, SOCK_STREAM, $proto); connect(MYSOCK, $server_struct) || exit(0); exit(1);' $IHOST $ONS_REM
+  if [ "$?" != "0" ]; then
+   ONS_REM_RUN="1"
+  else
+   ONS_REM_RUN="0"
+  fi
+  # End check ONS_REM running
+  if [ "$ONS_REQ_RUN" = "1" -o "$ONS_REM_RUN" = "1" ]; then
+   break
+  else
+   attempt=`expr $attempt + 1`
+   sleep $GRACETIME2
+  fi
+ done
+ if [ "$ONS_REQ_RUN" = "1" -o "$ONS_REM_RUN"="1" ]; then
+  $ECHO "1"
+ else 
+  $ECHO "0"
+ fi
+}
+
+##############
+# Main block #
+##############
+
+# Set configuration parameters
+get_config_parameters
+
+# Check ORA_HOME
+if [ -z "$ORA_HOME" ]; then
+ $ECHO "$0: ORA_HOME for middle tier not defined!"
+ $ECHO "Exiting..."
+ exit 1
+fi
+
+# Check oracle and get uid
+check_oracle_and_get_uid "$ORA_HOME" "sqlplus"
+
+case $1 in
+ stop)
+  CMDLIST=stop
+  ;;
+ start)
+  CMDLIST=start
+  ;;
+ restart)
+  CMDLIST="stop start"
+  ;;
+ *)
+  $ECHO "usage $0 <[start|stop|restart>"
+  exit 1
+  ;;
+esac
+
+$ECHO "`$BASENAME $0` will execute $1 for services:"
+
+for CMD in $CMDLIST
+do 
+ case $CMD in
+
+ start)
+  $ECHO "`date` Starting iAS middle tier..." >> $LOG
+  if [ "$USETNS" = "1" ]; then
+   # Start listener
+   $PRINTF "Listener:"
+   if [ "`isrunning tnslsnr`" = "1" ]; then
+    $ECHO "already running."
+   else
+    tnslsnr_ctl start $ORA_HOME
+    if [ "`isrunning tnslsnr`" = "1" ]; then
+     $ECHO "started."
+    else
+     $ECHO "start failed!"
+    fi
+   fi
+  fi
+  if [ "`infra_running`" = "0" ]; then
+   $ECHO "Infra NOT RUNNING!"
+   $ECHO "Infra NOT RUNNING!" >> $LOG
+   exit 1
+  else
+   # Start OPMN
+   $PRINTF "OPMN:"
+   opmn_ctl "start" $ORA_HOME
+   if [ "`isrunning opmn`" = "1" ]; then
+    $ECHO "started."
+   else
+    $ECHO "start failed!"
+   fi
+  fi
+  if [ "`midtier_running`" = "0" ]; then
+   $ECHO "Midtier start failed!"
+   $ECHO "Midtier start failed!" >> $LOG
+  else
+   $ECHO "Midtier started."
+   $ECHO "Midtier started." >> $LOG
+  fi
+  if [ "$USEIASCTL" = "1" ]; then
+   # Start iAS Control
+   iasconsole_ctl stop $ORA_HOME
+   iasconsole_ctl start $ORA_HOME
+  fi
+  $ECHO "`date` iAS middle tier started." >> $LOG
+  if [ "$OS_NAME" = "Linux" ]; then
+   # Linux up/down workaround
+   $TOUCH "$LOCK_DIR"/"$SCRIPT_NAME"
+  fi
+ ;;
+
+ stop)
+  $ECHO "`date` Stopping iAS middle tier..." >> $LOG
+  if [ "$USEIASCTL" = "1" ]; then
+   # Stop iAS Control
+   iasconsole_ctl stop $ORA_HOME
+  fi
+  opmn_ctl "stop" $ORA_HOME
+  if [ "`midtier_running`" = "0" ]; then
+   $ECHO "Midtier stopped."
+   $ECHO "Midtier stopped." >> $LOG
+  else
+   $ECHO "Midtier stop failed!"
+   $ECHO "Midtier stop failed!" >> $LOG
+  fi
+  if [ "$USETNS" = "1" ]; then
+   # Stop listener
+   $PRINTF "Listener:"
+   if [ "`isrunning tnslsnr`" = "0" ]; then
+    $ECHO "not running."
+   else
+    tnslsnr_ctl stop $ORA_HOME
+    if [ "`isrunning tnslsnr`" = "0" ]; then
+     $ECHO "stopped."
+    else
+     $ECHO "stop failed!"
+    fi
+   fi
+  fi
+  $ECHO "`date` iAS middle tier stopped." >> $LOG
+  if [ "$OS_NAME" = "Linux" ]; then
+   # Linux up/down workaround
+   $RM -f "$LOCK_DIR"/"$SCRIPT_NAME"
+  fi
+ ;;
+  *)
+  $ECHO "usage `$BASENAME $0: [stop|start|restart]`"
+  exit 1
+ ;;
+ esac
+
+done
